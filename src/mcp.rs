@@ -4,7 +4,7 @@ use anyhow::Result;
 use rmcp::{
     ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::CallToolResult,
+    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
     schemars::JsonSchema,
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -12,6 +12,22 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::browser;
+
+/// Env var that exposes developer diagnostics such as `inspect_discord_page`.
+const DEBUG_TOOLS_ENV: &str = "DISCORD_MCP_DEBUG_TOOLS";
+const DEBUG_TOOLS: &[&str] = &["inspect_discord_page"];
+
+const INSTRUCTIONS: &str = "\
+Discord via the user's logged-in web UI (persistent local browser profile). \
+Servers, channels, DMs and friends are identified by exact visible UI labels (or a stable channel_id when \
+returned); list them first and reuse values verbatim. List tools and get_messages page with offset/limit.\n\
+Writes (send_message, reply_message, delete_message) act as the user on their real account:\n\
+- Call without confirm first for a preview (no browser opened); set confirm=true only when the user clearly \
+asked for that exact action.\n\
+- Existing composer drafts are preserved unless clear_draft=true; only set it when the user asked.\n\
+- For replies/deletes prefer message_id from get_messages; message_text is a fallback matcher.\n\
+- delete_message is irreversible.\n\
+Errors are returned as tool results with isError=true; report them instead of retrying blindly.";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -22,8 +38,26 @@ pub struct DiscordServer {
 
 impl Default for DiscordServer {
     fn default() -> Self {
+        Self::with_debug_tools(debug_tools_enabled())
+    }
+}
+
+fn debug_tools_enabled() -> bool {
+    std::env::var(DEBUG_TOOLS_ENV)
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+impl DiscordServer {
+    fn with_debug_tools(debug_tools: bool) -> Self {
+        let mut tool_router = Self::tool_router();
+        if !debug_tools {
+            for name in DEBUG_TOOLS {
+                tool_router.remove_route(name);
+            }
+        }
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             _marker: Arc::new(()),
         }
     }
@@ -293,7 +327,7 @@ impl DiscordServer {
     /// Preview or send a message.
     #[tool(
         name = "send_message",
-        description = "Preview or send one message to a visible Discord channel or DM by label or stable channel_id. If the composer has a draft, it is reported and preserved unless clear_draft=true. This is an external write: confirm must be true to send, otherwise no browser is opened and only a preview is returned.",
+        description = "Send (or preview, if confirm is false) one message to a Discord channel or DM by visible label or channel_id. Writes as the user.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -322,7 +356,7 @@ impl DiscordServer {
     /// Preview or send a reply to a visible message.
     #[tool(
         name = "reply_message",
-        description = "Preview or reply to one visible Discord message in a channel or DM selected by label or stable channel_id. Provide message_id when available, otherwise message_text. Existing drafts are reported and preserved unless clear_draft=true. This is an external write: confirm must be true to send, otherwise no browser is opened.",
+        description = "Reply (or preview, if confirm is false) to a visible Discord message, by message_id (preferred) or message_text. Writes as the user.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -353,7 +387,7 @@ impl DiscordServer {
     /// Preview or delete a visible message.
     #[tool(
         name = "delete_message",
-        description = "Preview or delete one visible Discord message in a channel or DM selected by label or stable channel_id. Provide message_id when available, otherwise message_text. This is a destructive external write: confirm must be true to open the channel and delete the message; otherwise no browser is opened and only a preview is returned.",
+        description = "Delete (or preview, if confirm is false) one of the user's visible Discord messages, by message_id (preferred) or message_text. Irreversible.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -382,7 +416,7 @@ impl DiscordServer {
     /// Return low-level normalized page data for adapter diagnostics.
     #[tool(
         name = "inspect_discord_page",
-        description = "Read bounded visible Discord page text and DOM diagnostics for adapter development. Read-only.",
+        description = "Developer diagnostic: visible Discord page text and DOM data. Only exposed when DISCORD_MCP_DEBUG_TOOLS=1.",
         annotations(read_only_hint = true)
     )]
     async fn inspect_discord_page(&self) -> CallToolResult {
@@ -393,8 +427,17 @@ impl DiscordServer {
     }
 }
 
-#[tool_handler]
-impl rmcp::ServerHandler for DiscordServer {}
+#[tool_handler(router = self.tool_router)]
+impl rmcp::ServerHandler for DiscordServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                    .with_title("Discord"),
+            )
+            .with_instructions(INSTRUCTIONS)
+    }
+}
 
 pub async fn serve() -> Result<()> {
     let server = DiscordServer::default();
@@ -406,6 +449,34 @@ pub async fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::DiscordServer;
+    use rmcp::ServerHandler;
+
+    #[test]
+    fn debug_tools_hidden_by_default() {
+        let hidden = DiscordServer::with_debug_tools(false);
+        assert!(!hidden.tool_router.has_route("inspect_discord_page"));
+        assert!(hidden.tool_router.has_route("send_message"));
+        assert!(
+            DiscordServer::with_debug_tools(true)
+                .tool_router
+                .has_route("inspect_discord_page")
+        );
+    }
+
+    #[test]
+    fn server_info_names_server_and_has_instructions() {
+        let info = DiscordServer::with_debug_tools(false).get_info();
+        assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
+        assert!(info.instructions.unwrap_or_default().contains("confirm"));
+    }
+
+    #[test]
+    fn tool_descriptions_stay_short() {
+        for tool in DiscordServer::tool_router().list_all() {
+            let len = tool.description.as_deref().unwrap_or_default().len();
+            assert!(len <= 250, "{} description is {len} chars", tool.name);
+        }
+    }
 
     #[test]
     fn tools_advertise_read_only_hints() {

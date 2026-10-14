@@ -252,11 +252,11 @@ async fn open_discord(headful: bool) -> Result<BrowserSession> {
         let mut pages = browser.pages().await?;
         let mut discord_page = None;
         for candidate in pages.iter().cloned() {
-            if let Ok(Some(url)) = candidate.url().await {
-                if is_authenticated_url(&url) || url.contains("discord.com") {
-                    discord_page = Some(candidate);
-                    break;
-                }
+            if let Ok(Some(url)) = candidate.url().await
+                && (is_authenticated_url(&url) || url.contains("discord.com"))
+            {
+                discord_page = Some(candidate);
+                break;
             }
         }
         discord_page
@@ -287,7 +287,7 @@ async fn finish(mut session: BrowserSession) -> Result<()> {
         Ok(())
     };
     session.handler_task.abort();
-    result.map_err(Into::into)
+    result
 }
 
 async fn prepared_page() -> Result<BrowserSession> {
@@ -1097,6 +1097,7 @@ async fn start_reply(
         .to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn reply_message(
     channel_name: &str,
     channel_id: Option<&str>,
